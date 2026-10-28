@@ -11,10 +11,10 @@
 #define TAM_BLOQUE         (64*1024)    // tam bloque de datos = 64KB
 
 // Valores de respuesta de funciones
-#define PROTO_OK            0   // ok
-#define PROTO_ERR_IO       -1   // error de red o conexión cerrada
-#define PROTO_ERR_VERSION  -2   // diferente versión
-#define PROTO_ERR_LONGITUD -3   // longitud excedida
+#define PROTOCOL_OK            0   // ok
+#define PROTOCOL_ERR_IO       -1   // error de red o conexión cerrada
+#define PROTOCOL_ERR_VERSION  -2   // diferente versión
+#define PROTOCOL_ERR_LONGITUD -3   // longitud excedida
 
 
 // Mensajes

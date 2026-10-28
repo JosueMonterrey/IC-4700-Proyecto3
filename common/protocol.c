@@ -22,16 +22,16 @@ int enviar(int socket, const void *buff, size_t n)
             if (errno == EINTR)
                 continue; // reintentar
 
-            return PROTO_ERR_IO;
+            return PROTOCOL_ERR_IO;
         }
 
         if (enviados == 0)
-            return PROTO_ERR_IO;
+            return PROTOCOL_ERR_IO;
 
         total_enviados += (size_t)enviados;
     }
 
-    return PROTO_OK;
+    return PROTOCOL_OK;
 }
 
 // Recibir n bytes
@@ -49,16 +49,16 @@ int recibir(int socket, void *buff, size_t n)
             if (errno == EINTR)
                 continue; // reintentar
 
-            return PROTO_ERR_IO;
+            return PROTOCOL_ERR_IO;
         }
 
         if (recibidos == 0)
-            return PROTO_ERR_IO; // conexion fue cerrada
+            return PROTOCOL_ERR_IO; // conexion fue cerrada
 
         total_recibidos += (size_t)recibidos;
     }
 
-    return PROTO_OK;
+    return PROTOCOL_OK;
 }
 
 /* ------------------------------------------------------------------ */
@@ -116,10 +116,10 @@ int enviar_msg(int socket, uint16_t tipo, uint16_t estado, uint32_t id, const vo
     uint8_t bytes[TAM_ENCABEZADO];
 
     if (longitud > MAX_CARGA)
-        return PROTO_ERR_LONGITUD;
+        return PROTOCOL_ERR_LONGITUD;
 
     if (longitud > 0 && carga == NULL)
-        return PROTO_ERR_LONGITUD;
+        return PROTOCOL_ERR_LONGITUD;
 
     enc.version = PROTO_VERSION;
     enc.tipo = tipo;
@@ -130,13 +130,13 @@ int enviar_msg(int socket, uint16_t tipo, uint16_t estado, uint32_t id, const vo
 
     codificar_enc(bytes, &enc);
 
-    if (enviar(socket, bytes, TAM_ENCABEZADO) != PROTO_OK)
-        return PROTO_ERR_IO;
+    if (enviar(socket, bytes, TAM_ENCABEZADO) != PROTOCOL_OK)
+        return PROTOCOL_ERR_IO;
 
-    if (longitud > 0 && enviar(socket, carga, longitud) != PROTO_OK)
-        return PROTO_ERR_IO;
+    if (longitud > 0 && enviar(socket, carga, longitud) != PROTOCOL_OK)
+        return PROTOCOL_ERR_IO;
 
-    return PROTO_OK;
+    return PROTOCOL_OK;
 }
 
 // Recibir un mensaje
@@ -144,25 +144,25 @@ int recibir_msg(int socket, struct encabezado *enc, void *carga, uint32_t max_ca
 {
     uint8_t bytes[TAM_ENCABEZADO];
 
-    if (recibir(socket, bytes, TAM_ENCABEZADO) != PROTO_OK)
-        return PROTO_ERR_IO;
+    if (recibir(socket, bytes, TAM_ENCABEZADO) != PROTOCOL_OK)
+        return PROTOCOL_ERR_IO;
 
     decodificar_enc(enc, bytes);
 
     if (enc->version != PROTO_VERSION)
-        return PROTO_ERR_VERSION;
+        return PROTOCOL_ERR_VERSION;
 
     if (enc->longitud > MAX_CARGA || enc->longitud > max_carga)
-        return PROTO_ERR_LONGITUD;
+        return PROTOCOL_ERR_LONGITUD;
 
     if (enc->longitud > 0)
     {
         if (carga == NULL)
-            return PROTO_ERR_LONGITUD;
-            
-        if (recibir(socket, carga, enc->longitud) != PROTO_OK)
-            return PROTO_ERR_IO;
+            return PROTOCOL_ERR_LONGITUD;
+
+        if (recibir(socket, carga, enc->longitud) != PROTOCOL_OK)
+            return PROTOCOL_ERR_IO;
     }
 
-    return PROTO_OK;
+    return PROTOCOL_OK;
 }
