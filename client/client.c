@@ -1,13 +1,17 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include <errno.h>
+#include <fcntl.h>
 #include <getopt.h>
+#include <limits.h>
 #include <netdb.h>
 #include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -16,7 +20,16 @@
 #include "log.h"
 #include "protocol.h"
 
+#define SALIDA_INTERRUMPIDO 130 // Ctrl+c
+
 static uint32_t g_id = 0;
+static volatile sig_atomic_t g_interrumpido = 0;
+
+static void manejador_senal(int sig)
+{
+    (void)sig;
+    g_interrumpido = 1;
+}
 
 static void ayuda(FILE *out, const char *prog)
 {
@@ -29,7 +42,11 @@ static void ayuda(FILE *out, const char *prog)
             "  --host DIRECCION     Direccion IP o nombre del servidor\n"
             "  --puerto N           Puerto del servidor (1-65535)\n"
             "  --accion ACCION      canal | listar | descargar\n"
-            "                       (por ahora solo 'listar' esta implementada)\n"
+            "                       (por ahora solo 'listar' y 'descargar' estan implementadas)\n"
+            "\n"
+            "Requeridos para la accion 'descargar':\n"
+            "  --archivo NOMBRE     Nombre del contenido tal como aparece en el catalogo\n"
+            "  --destino RUTA       Directorio o archivo donde guardar lo recibido\n"
             "\n"
             "Opcionales:\n"
             "  --tiempo-limite S    Segundos maximos de espera de conexion o de respuesta\n"
@@ -38,10 +55,12 @@ static void ayuda(FILE *out, const char *prog)
             "\n"
             "Ejemplos:\n"
             "  %s --host 127.0.0.1 --puerto 8080 --accion listar\n"
-            "  %s --host 192.168.1.20 --puerto 8080 --accion listar --tiempo-limite 5\n"
+            "  %s --host 127.0.0.1 --puerto 8080 --accion descargar --archivo video.mp4 --destino ./descargas/\n"
+            "  %s --host 192.168.1.20 --puerto 8080 --accion descargar --archivo video.mp4 --destino copia.mp4 --tiempo-limite 5\n"
             "\n"
-            "Codigos de salida: 0 exito, 2 argumentos, 3 red, 4 contenido, 5 capacidad, 6 interno.\n",
-            prog, prog, prog);
+            "Codigos de salida: 0 exito, 2 argumentos, 3 red, 4 contenido, 5 capacidad, 6 interno,\n"
+            "                   130 interrumpido por el usuario.\n",
+            prog, prog, prog, prog);
 }
 
 static int entero(const char *txt, long min, long max, long *out)
@@ -69,7 +88,67 @@ struct config
     int puerto;
     const char *accion;
     int tiempo_limite;
+    const char *archivo;
+    const char *destino;
+    char ruta_final[PATH_MAX];       // ruta definitiva de la descarga
+    char ruta_parcial[PATH_MAX + 8]; // ruta temporal ".part" mientras se recibe
 };
+
+// Calcula la ruta final y valida que se pueda escribir ahi (antes de usar la red)
+static int resolver_destino(struct config *cfg)
+{
+    struct stat st;
+    int n;
+
+    if (stat(cfg->destino, &st) == 0 && S_ISDIR(st.st_mode))
+    {
+        if (access(cfg->destino, W_OK | X_OK) != 0)
+            ERR_ARG("--destino '%s' es un directorio sin permiso de escritura", cfg->destino);
+
+        n = snprintf(cfg->ruta_final, sizeof cfg->ruta_final, "%s/%s", cfg->destino, cfg->archivo);
+    }
+    else
+    {
+        size_t dlen = strlen(cfg->destino);
+        if (dlen == 0 || cfg->destino[dlen - 1] == '/')
+            ERR_ARG("--destino '%s' no es un directorio existente ni un nombre de archivo", cfg->destino);
+
+        if (errno == 0 || stat(cfg->destino, &st) == 0)
+        {
+            if (stat(cfg->destino, &st) == 0 && !S_ISREG(st.st_mode))
+                ERR_ARG("--destino '%s' existe y no es un archivo regular", cfg->destino);
+        }
+
+        n = snprintf(cfg->ruta_final, sizeof cfg->ruta_final, "%s", cfg->destino);
+        if (n < 0 || (size_t)n >= sizeof cfg->ruta_final)
+            ERR_ARG("--destino es demasiado largo");
+
+        // el directorio padre debe existir y ser escribible
+        char padre[PATH_MAX];
+        snprintf(padre, sizeof padre, "%s", cfg->ruta_final);
+        char *barra = strrchr(padre, '/');
+        if (barra == NULL)
+            snprintf(padre, sizeof padre, ".");
+        else if (barra == padre)
+            padre[1] = '\0';
+        else
+            *barra = '\0';
+
+        if (stat(padre, &st) != 0 || !S_ISDIR(st.st_mode))
+            ERR_ARG("el directorio '%s' del destino no existe", padre);
+        if (access(padre, W_OK | X_OK) != 0)
+            ERR_ARG("el directorio '%s' del destino no es escribible", padre);
+    }
+
+    if (n < 0 || (size_t)n >= sizeof cfg->ruta_final)
+        ERR_ARG("la ruta de destino es demasiado larga");
+
+    n = snprintf(cfg->ruta_parcial, sizeof cfg->ruta_parcial, "%s.part", cfg->ruta_final);
+    if (n < 0 || (size_t)n >= sizeof cfg->ruta_parcial)
+        ERR_ARG("la ruta de destino es demasiado larga");
+
+    return 0;
+}
 
 /* 0 = válida, 1 = se pidió ayuda, -1 = error */
 static int leer_config(int argc, char **argv, struct config *cfg)
@@ -78,6 +157,8 @@ static int leer_config(int argc, char **argv, struct config *cfg)
         {"host", required_argument, NULL, 'H'},
         {"puerto", required_argument, NULL, 'p'},
         {"accion", required_argument, NULL, 'a'},
+        {"archivo", required_argument, NULL, 'f'},
+        {"destino", required_argument, NULL, 'd'},
         {"tiempo-limite", required_argument, NULL, 't'},
         {"ayuda", no_argument, NULL, 'h'},
         {"help", no_argument, NULL, 'h'},
@@ -88,6 +169,8 @@ static int leer_config(int argc, char **argv, struct config *cfg)
 
     cfg->host = NULL;
     cfg->accion = NULL;
+    cfg->archivo = NULL;
+    cfg->destino = NULL;
     cfg->tiempo_limite = 10;
 
     opterr = 0;
@@ -103,6 +186,12 @@ static int leer_config(int argc, char **argv, struct config *cfg)
             break;
         case 'a':
             cfg->accion = optarg;
+            break;
+        case 'f':
+            cfg->archivo = optarg;
+            break;
+        case 'd':
+            cfg->destino = optarg;
             break;
         case 't':
             if (entero(optarg, 1, 3600, &v) != 0)
@@ -129,13 +218,33 @@ static int leer_config(int argc, char **argv, struct config *cfg)
         ERR_ARG("--puerto debe ser un entero entre 1 y 65535 (recibido '%s')", puerto_txt);
     cfg->puerto = (int)v;
 
-    if (strcmp(cfg->accion, "listar") != 0)
+    if (strcmp(cfg->accion, "listar") == 0)
     {
-        if (strcmp(cfg->accion, "canal") == 0 || strcmp(cfg->accion, "descargar") == 0)
-            ERR_ARG("la accion '%s' todavia no esta implementada en esta version", cfg->accion);
-        ERR_ARG("--accion '%s' no es valida; use canal, listar o descargar", cfg->accion);
+        if (cfg->archivo != NULL || cfg->destino != NULL)
+            ERR_ARG("--archivo y --destino solo se usan con la accion 'descargar'");
+        return 0;
     }
-    return 0;
+
+    if (strcmp(cfg->accion, "descargar") == 0)
+    {
+        if (cfg->archivo == NULL)
+            ERR_ARG("la accion 'descargar' requiere --archivo");
+        if (cfg->destino == NULL)
+            ERR_ARG("la accion 'descargar' requiere --destino");
+
+        size_t alen = strlen(cfg->archivo);
+        if (alen == 0 || alen > MAX_NOMBRE)
+            ERR_ARG("--archivo debe tener entre 1 y %d caracteres", MAX_NOMBRE);
+        if (cfg->archivo[0] == '.' || strchr(cfg->archivo, '/') != NULL || strchr(cfg->archivo, '\\') != NULL)
+            ERR_ARG("--archivo '%s' no es un nombre de contenido valido (sin rutas ni nombres ocultos)", cfg->archivo);
+
+        return resolver_destino(cfg);
+    }
+
+    if (strcmp(cfg->accion, "canal") == 0)
+        ERR_ARG("la accion 'canal' todavia no esta implementada en esta version");
+
+    ERR_ARG("--accion '%s' no es valida; use canal, listar o descargar", cfg->accion);
 }
 
 static int conectar(const struct config *cfg)
@@ -202,13 +311,10 @@ static int codigo_por_estado(uint16_t st)
     }
 }
 
-static int recibir_esperado(int socket, uint16_t tipo_esperado, struct encabezado *enc, char *buff, uint32_t cap)
+static int fallo_recepcion(int r, const struct encabezado *enc)
 {
-    switch (recibir_msg(socket, enc, buff, cap))
+    switch (r)
     {
-    case PROTOCOL_OK:
-        break;
-
     case PROTOCOL_ERR_VERSION:
         log_error("el servidor responde con otra version del protocolo (%u)", (unsigned)enc->version);
         return SALIDA_RED;
@@ -222,10 +328,10 @@ static int recibir_esperado(int socket, uint16_t tipo_esperado, struct encabezad
         log_error("sin respuesta del servidor (tiempo agotado o conexion cerrada)");
         return SALIDA_RED;
     }
+}
 
-    if (enc->tipo == tipo_esperado)
-        return 0;
-
+static int mensaje_inesperado(const struct encabezado *enc, const char *buff)
+{
     if (enc->tipo == ERROR)
     {
         log_error("el servidor rechazo la solicitud (codigo %u): %.*s", (unsigned)enc->estado, (int)enc->longitud, buff);
@@ -239,6 +345,18 @@ static int recibir_esperado(int socket, uint16_t tipo_esperado, struct encabezad
 
     log_error("respuesta inesperada del servidor (tipo %u)", (unsigned)enc->tipo);
     return SALIDA_INTERNO;
+}
+
+static int recibir_esperado(int socket, uint16_t tipo_esperado, struct encabezado *enc, char *buff, uint32_t cap)
+{
+    int r = recibir_msg(socket, enc, buff, cap);
+    if (r != PROTOCOL_OK)
+        return fallo_recepcion(r, enc);
+
+    if (enc->tipo == tipo_esperado)
+        return 0;
+
+    return mensaje_inesperado(enc, buff);
 }
 
 static int accion_listar(int socket)
@@ -306,6 +424,175 @@ fin:
     return rc;
 }
 
+static int escribir_todo(int fd, const char *p, size_t n)
+{
+    while (n > 0)
+    {
+        ssize_t w = write(fd, p, n);
+        if (w < 0)
+        {
+            if (errno == EINTR)
+                continue;
+            return -1;
+        }
+        p += w;
+        n -= (size_t)w;
+    }
+    return 0;
+}
+
+static void progreso(uint64_t recibidos, uint64_t total)
+{
+    if (total > 0)
+        printf("\r  %llu / %llu bytes (%3u%%)", (unsigned long long)recibidos, (unsigned long long)total, (unsigned)(recibidos * 100 / total));
+    else
+        printf("\r  0 / 0 bytes");
+    fflush(stdout);
+}
+
+static int accion_descargar(int socket, const struct config *cfg)
+{
+    struct encabezado enc;
+    int rc = SALIDA_INTERNO;
+    int fd = -1;
+    int creado = 0;
+    char meta[64];
+    char *bloque = malloc(TAM_BLOQUE);
+
+    if (bloque == NULL)
+    {
+        log_error("sin memoria");
+        return SALIDA_INTERNO;
+    }
+
+    size_t nlen = strlen(cfg->archivo);
+    if (enviar_msg(socket, ABRIR, OK, ++g_id, cfg->archivo, (uint32_t)nlen) != PROTOCOL_OK)
+    {
+        log_error("no se pudo enviar la solicitud ABRIR");
+        rc = SALIDA_RED;
+        goto fin;
+    }
+
+    log_info("solicitud ABRIR '%s' enviada", cfg->archivo);
+
+    rc = recibir_esperado(socket, ACEPTADO, &enc, meta, sizeof meta - 1);
+    if (rc != 0)
+        goto fin;
+
+    meta[enc.longitud] = '\0';
+    char *fin_num;
+    errno = 0;
+    unsigned long long total_ull = strtoull(meta, &fin_num, 10);
+    if (meta[0] == '\0' || *fin_num != '\0' || errno != 0)
+    {
+        log_error("el servidor anuncio un tamaño invalido");
+        rc = SALIDA_INTERNO;
+        goto fin;
+    }
+
+    uint64_t total = (uint64_t)total_ull;
+    log_info("el servidor acepto la solicitud: %llu bytes", total_ull);
+
+    fd = open(cfg->ruta_parcial, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0)
+    {
+        log_error("no se pudo crear '%s': %s", cfg->ruta_parcial, strerror(errno));
+        rc = SALIDA_INTERNO;
+        goto fin;
+    }
+    creado = 1;
+
+    uint64_t recibidos = 0;
+    progreso(recibidos, total);
+
+    while (recibidos < total)
+    {
+        if (g_interrumpido)
+        {
+            printf("\n");
+            log_error("descarga interrumpida por el usuario");
+            rc = SALIDA_INTERRUMPIDO;
+            goto fin;
+        }
+
+        int r = recibir_msg(socket, &enc, bloque, TAM_BLOQUE);
+        if (r != PROTOCOL_OK)
+        {
+            printf("\n");
+            rc = g_interrumpido ? SALIDA_INTERRUMPIDO : fallo_recepcion(r, &enc);
+            goto fin;
+        }
+
+        if (enc.tipo != DATOS)
+        {
+            printf("\n");
+            rc = mensaje_inesperado(&enc, bloque);
+            goto fin;
+        }
+
+        if (recibidos + enc.longitud > total)
+        {
+            printf("\n");
+            log_error("el servidor envio mas bytes de los anunciados");
+            rc = SALIDA_INTERNO;
+            goto fin;
+        }
+
+        if (escribir_todo(fd, bloque, enc.longitud) != 0)
+        {
+            printf("\n");
+            log_error("error al escribir en '%s': %s", cfg->ruta_parcial, strerror(errno));
+            rc = SALIDA_INTERNO;
+            goto fin;
+        }
+
+        recibidos += enc.longitud;
+        progreso(recibidos, total);
+    }
+
+    printf("\n");
+
+    rc = recibir_esperado(socket, FIN, &enc, bloque, TAM_BLOQUE);
+    if (rc != 0)
+        goto fin;
+
+    if (recibidos != total)
+    {
+        log_error("discrepancia: se recibieron %llu bytes y se anunciaron %llu", (unsigned long long)recibidos, (unsigned long long)total);
+        rc = SALIDA_INTERNO;
+        goto fin;
+    }
+
+    if (close(fd) != 0)
+    {
+        fd = -1;
+        log_error("error al cerrar '%s': %s", cfg->ruta_parcial, strerror(errno));
+        rc = SALIDA_INTERNO;
+        goto fin;
+    }
+    
+    fd = -1;
+
+    if (rename(cfg->ruta_parcial, cfg->ruta_final) != 0)
+    {
+        log_error("no se pudo mover a '%s': %s", cfg->ruta_final, strerror(errno));
+        rc = SALIDA_INTERNO;
+        goto fin;
+    }
+
+    creado = 0;
+    log_info("descarga completa: %llu bytes guardados en '%s'", (unsigned long long)recibidos, cfg->ruta_final);
+    rc = SALIDA_OK;
+
+fin:
+    if (fd >= 0)
+        close(fd);
+    if (creado)
+        unlink(cfg->ruta_parcial); // no dejar parciales confundibles con una descarga completa
+    free(bloque);
+    return rc;
+}
+
 // MAIN
 int main(int argc, char **argv)
 {
@@ -319,11 +606,18 @@ int main(int argc, char **argv)
     }
     if (r < 0)
     {
-        fprintf(stderr, "Forma de uso: %s --host DIRECCION --puerto N --accion listar   (use --ayuda para mas detalles)\n", argv[0]);
+        fprintf(stderr, "Forma de uso: %s --host DIRECCION --puerto N --accion listar|descargar   (use --ayuda para mas detalles)\n", argv[0]);
         return SALIDA_ARGS;
     }
 
     signal(SIGPIPE, SIG_IGN);
+
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = manejador_senal;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
 
     int socket = conectar(&cfg);
     if (socket < 0)
@@ -353,17 +647,24 @@ int main(int argc, char **argv)
     saludo[enc.longitud] = '\0'; // arreglar string
     log_info("sesion establecida (servidor: %s)", saludo);
 
-    rc = accion_listar(socket);
+    if (strcmp(cfg.accion, "descargar") == 0)
+        rc = accion_descargar(socket, &cfg);
+    else
+        rc = accion_listar(socket);
 
-    if (enviar_msg(socket, CERRAR, OK, ++g_id, NULL, 0) == PROTOCOL_OK)
+    // Cierre ordenado solo si el flujo sigue sincronizado
+    if (rc != SALIDA_RED && rc != SALIDA_INTERRUMPIDO && rc != SALIDA_INTERNO)
     {
-        char buff[128];
-        recibir_msg(socket, &enc, buff, sizeof buff);
+        if (enviar_msg(socket, CERRAR, OK, ++g_id, NULL, 0) == PROTOCOL_OK)
+        {
+            char buff[128];
+            recibir_msg(socket, &enc, buff, sizeof buff);
+        }
     }
     close(socket);
 
     if (rc == SALIDA_OK)
         log_info("operacion completada");
-        
+
     return rc;
 }
