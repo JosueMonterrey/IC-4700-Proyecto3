@@ -15,9 +15,10 @@
 #include <unistd.h>
 
 #include "catalog.h"
-#include "exitcodes.h"
-#include "log.h"
-#include "protocol.h"
+#include "channel.h"
+#include "../common/exitcodes.h"
+#include "../common/log.h"
+#include "../common/protocol.h"
 #include "session.h"
 
 enum modo
@@ -35,6 +36,10 @@ struct config
     const char *direccion;
     int inactividad;
     int profundidad;
+    const char *canal[MAX_ELEMENTOS_CANAL];
+    size_t n_canal;
+    double duracion_canal; // segundos
+    double separacion;     // segundos entre ciclos
 };
 
 static void ayuda(FILE *out, const char *prog)
@@ -49,6 +54,8 @@ static void ayuda(FILE *out, const char *prog)
             "                       (por ahora solo FIFO esta implementado)\n"
             "  --puerto N           Puerto de escucha (1-65535)\n"
             "  --dir RUTA           Directorio con los videos del catalogo\n"
+            "  --canal ARCHIVO      Contenido del canal en vivo. Se puede repetir para formar una\n"
+            "                       lista ordenada (maximo %d). Se recomienda MPEG-TS (.ts)\n"
             "\n"
             "Opcionales:\n"
             "  --direccion IP       Direccion IPv4 donde escuchar (por omision: 0.0.0.0,\n"
@@ -57,14 +64,19 @@ static void ayuda(FILE *out, const char *prog)
             "                       (por omision: 60)\n"
             "  --profundidad N      Conexiones pendientes admitidas en la cola\n"
             "                       (por omision: 16)\n"
+            "  --duracion-canal S   Duracion total declarada del contenido del canal, en segundos.\n"
+            "                       Si se omite, se consulta a ffprobe archivo por archivo\n"
+            "  --separacion S       Segundos sin contenido entre el final de un ciclo y el inicio\n"
+            "                       del siguiente (por omision: 0)\n"
             "  --ayuda, -h          Muestra esta ayuda\n"
             "\n"
             "Ejemplos:\n"
-            "  %s --modo FIFO --puerto 8080 --dir videos/\n"
-            "  %s --modo FIFO --puerto 9000 --dir /srv/videos --direccion 127.0.0.1 --inactividad 30\n"
+            "  %s --modo FIFO --puerto 8080 --dir videos/ --canal canal.ts\n"
+            "  %s --modo FIFO --puerto 9000 --dir /srv/videos --canal a.ts --canal b.ts \\\n"
+            "       --duracion-canal 600 --separacion 5 --direccion 127.0.0.1\n"
             "\n"
             "Codigos de salida: 0 exito, 2 argumentos, 3 red, 5 capacidad, 6 interno.\n",
-            prog, prog, prog);
+            prog, MAX_ELEMENTOS_CANAL, prog, prog);
 }
 
 static int entero(const char *txt, long min, long max, long *out)
@@ -73,6 +85,17 @@ static int entero(const char *txt, long min, long max, long *out)
     errno = 0;
     long v = strtol(txt, &fin, 10);
     if (txt[0] == '\0' || *fin != '\0' || errno != 0 || v < min || v > max)
+        return -1;
+    *out = v;
+    return 0;
+}
+
+static int decimal(const char *txt, double min, double max, double *out)
+{
+    char *fin;
+    errno = 0;
+    double v = strtod(txt, &fin);
+    if (txt[0] == '\0' || *fin != '\0' || errno != 0 || !(v >= min && v <= max))
         return -1;
     *out = v;
     return 0;
@@ -99,19 +122,25 @@ static int leer_config(int argc, char **argv, struct config *cfg)
         {"direccion", required_argument, NULL, 'a'},
         {"inactividad", required_argument, NULL, 'i'},
         {"profundidad", required_argument, NULL, 'q'},
+        {"canal", required_argument, NULL, 'c'},
+        {"duracion-canal", required_argument, NULL, 'u'},
+        {"separacion", required_argument, NULL, 's'},
         {"ayuda", no_argument, NULL, 'h'},
         {"help", no_argument, NULL, 'h'},
-        {NULL, 0, NULL, 0}
-    };
+        {NULL, 0, NULL, 0}};
 
     const char *modo_txt = NULL, *puerto_txt = NULL;
     long v;
+    double dv;
     int c;
 
     cfg->dir = NULL;
     cfg->direccion = "0.0.0.0";
     cfg->inactividad = 60;
     cfg->profundidad = 16;
+    cfg->n_canal = 0;
+    cfg->duracion_canal = 0;
+    cfg->separacion = 0;
 
     opterr = 0;
     while ((c = getopt_long(argc, argv, "h", args, NULL)) != -1)
@@ -140,6 +169,23 @@ static int leer_config(int argc, char **argv, struct config *cfg)
                 return error_arg("--profundidad debe ser un entero entre 1 y 1024 (recibido '%s')", optarg);
             cfg->profundidad = (int)v;
             break;
+        case 'c':
+            if (cfg->n_canal >= MAX_ELEMENTOS_CANAL)
+                return error_arg("--canal admite como maximo %d archivos", MAX_ELEMENTOS_CANAL);
+            if (optarg[0] == '\0')
+                return error_arg("--canal no puede estar vacio");
+            cfg->canal[cfg->n_canal++] = optarg;
+            break;
+        case 'u':
+            if (decimal(optarg, 1, 604800, &dv) != 0)
+                return error_arg("--duracion-canal debe ser un numero de segundos entre 1 y 604800 (recibido '%s')", optarg);
+            cfg->duracion_canal = dv;
+            break;
+        case 's':
+            if (decimal(optarg, 0, 86400, &dv) != 0)
+                return error_arg("--separacion debe ser un numero de segundos entre 0 y 86400 (recibido '%s')", optarg);
+            cfg->separacion = dv;
+            break;
         case 'h':
             return 1;
         default:
@@ -158,6 +204,9 @@ static int leer_config(int argc, char **argv, struct config *cfg)
 
     if (cfg->dir == NULL)
         return error_arg("falta --dir (directorio de videos)");
+
+    if (cfg->n_canal == 0)
+        return error_arg("falta --canal (archivo del canal en vivo)");
 
     if (strcmp(modo_txt, "FIFO") == 0)
         cfg->modo = FIFO;
@@ -182,7 +231,7 @@ static int leer_config(int argc, char **argv, struct config *cfg)
     struct stat st;
     if (stat(cfg->dir, &st) != 0)
         return error_arg("--dir '%s' no se puede leer: %s", cfg->dir, strerror(errno));
-        
+
     if (!S_ISDIR(st.st_mode))
         return error_arg("--dir '%s' no es un directorio", cfg->dir);
 
@@ -264,7 +313,13 @@ int main(int argc, char **argv)
     if (disponibles == 0)
         log_error("el catalogo esta vacio: no hay contenido por el momento");
 
-    // 3. Iniciar servidor
+    // 3. Canal en vivo
+    struct canal canal;
+    int hay_canal = (canal_construir(&canal, cfg.canal, cfg.n_canal, cfg.duracion_canal, cfg.separacion) == 0);
+    if (!hay_canal)
+        log_error("el canal en vivo no sera iniciado");
+
+    // 4. Iniciar servidor
     instalar_senales();
     int socket = crear_escucha(cfg.direccion, cfg.puerto, cfg.profundidad);
     if (socket < 0)
@@ -274,14 +329,22 @@ int main(int argc, char **argv)
         else
             log_error("no se pudo escuchar en %s:%d: %s", cfg.direccion, cfg.puerto, strerror(errno));
         catalogo_liberar(&cat);
+        if (hay_canal)
+            canal_liberar(&canal);
         return SALIDA_RED;
     }
+
+    if (hay_canal)
+        canal_iniciar(&canal); // t0
 
     log_info("Servidor iniciado. Modo=FIFO, escuchando en %s:%d", cfg.direccion, cfg.puerto);
     log_info("Catalogo: %zu entradas (%zu disponibles). Inactividad=%d s, cola=%d",
              cat.cantidad, disponibles, cfg.inactividad, cfg.profundidad);
 
-    // 4. Bucle FIFO: admitir -> atender -> cerrar -> admitir
+    if (hay_canal)
+        log_info("Canal en vivo: %zu elemento(s), contenido %.1f s, separacion %.1f s, ciclo %.1f s", canal.cantidad, (double)canal.contenido_ns / 1e9, (double)canal.separacion_ns / 1e9, (double)canal.ciclo_ns / 1e9);
+
+    // 5. Bucle FIFO: admitir -> atender -> cerrar -> admitir
     unsigned long atendidas = 0;
 
     while (!detencion_solicitada())
@@ -319,16 +382,18 @@ int main(int argc, char **argv)
 
         log_info("[%s] conexion admitida (FIFO: se atiende hasta concluir)", origen);
 
-        atender_sesion(client_socket, &cat, origen, cfg.inactividad);
+        atender_sesion(client_socket, &cat, hay_canal ? &canal : NULL, origen, cfg.inactividad);
         close(client_socket);
 
         atendidas++;
         log_info("[%s] conexion cerrada; el servidor queda libre para la siguiente", origen);
     }
 
-    // 5. Cerrar servidor
+    // 6. Cerrar servidor
     close(socket);
     catalogo_liberar(&cat);
+    if (hay_canal)
+        canal_liberar(&canal);
     log_info("Servidor detenido de forma ordenada. Sesiones atendidas: %lu", atendidas);
     return SALIDA_OK;
 }

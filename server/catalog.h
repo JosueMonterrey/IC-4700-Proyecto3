@@ -3,7 +3,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
-#include "protocol.h"
+#include "../common/protocol.h"
 
 // Struc para elemento del catalogo
 struct entrada_catalogo {

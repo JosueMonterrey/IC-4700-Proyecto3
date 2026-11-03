@@ -5,6 +5,7 @@
 #include <getopt.h>
 #include <limits.h>
 #include <netdb.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -14,16 +15,19 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "exitcodes.h"
 #include "log.h"
 #include "protocol.h"
+#include "reproductor.h"
 
 #define SALIDA_INTERRUMPIDO 130 // Ctrl+c
 
 static uint32_t g_id = 0;
 static volatile sig_atomic_t g_interrumpido = 0;
+static int g_flujo_sincronizado = 0; // 1 si tras una interrupcion el protocolo quedo en un punto limpio
 
 static void manejador_senal(int sig)
 {
@@ -42,7 +46,6 @@ static void ayuda(FILE *out, const char *prog)
             "  --host DIRECCION     Direccion IP o nombre del servidor\n"
             "  --puerto N           Puerto del servidor (1-65535)\n"
             "  --accion ACCION      canal | listar | descargar\n"
-            "                       (por ahora solo 'listar' y 'descargar' estan implementadas)\n"
             "\n"
             "Requeridos para la accion 'descargar':\n"
             "  --archivo NOMBRE     Nombre del contenido tal como aparece en el catalogo\n"
@@ -51,16 +54,23 @@ static void ayuda(FILE *out, const char *prog)
             "Opcionales:\n"
             "  --tiempo-limite S    Segundos maximos de espera de conexion o de respuesta\n"
             "                       (por omision: 10)\n"
+            "  --tiempo-canal S     Duracion maxima de la conexion al canal (solo 'canal');\n"
+            "                       si se omite, es indefinida (Ctrl+C para salir)\n"
+            "  --reproductor PROG   Programa de video que recibe el contenido por stdin\n"
+            "                       (se invoca como 'PROG -'). Por omision: mpv, ffplay, vlc o mplayer\n"
+            "  --sin-reproductor    No lanzar reproductor (el canal se recibe y se descarta)\n"
             "  --ayuda, -h          Muestra esta ayuda\n"
             "\n"
             "Ejemplos:\n"
+            "  %s --host 127.0.0.1 --puerto 8080 --accion canal\n"
+            "  %s --host 127.0.0.1 --puerto 8080 --accion canal --tiempo-canal 120 --sin-reproductor\n"
             "  %s --host 127.0.0.1 --puerto 8080 --accion listar\n"
             "  %s --host 127.0.0.1 --puerto 8080 --accion descargar --archivo video.mp4 --destino ./descargas/\n"
             "  %s --host 192.168.1.20 --puerto 8080 --accion descargar --archivo video.mp4 --destino copia.mp4 --tiempo-limite 5\n"
             "\n"
             "Codigos de salida: 0 exito, 2 argumentos, 3 red, 4 contenido, 5 capacidad, 6 interno,\n"
             "                   130 interrumpido por el usuario.\n",
-            prog, prog, prog, prog);
+            prog, prog, prog, prog, prog, prog);
 }
 
 static int entero(const char *txt, long min, long max, long *out)
@@ -90,6 +100,9 @@ struct config
     int tiempo_limite;
     const char *archivo;
     const char *destino;
+    const char *reproductor;
+    int sin_reproductor;
+    int tiempo_canal;                // 0 = indefinido
     char ruta_final[PATH_MAX];       // ruta definitiva de la descarga
     char ruta_parcial[PATH_MAX + 8]; // ruta temporal ".part" mientras se recibe
 };
@@ -160,6 +173,9 @@ static int leer_config(int argc, char **argv, struct config *cfg)
         {"archivo", required_argument, NULL, 'f'},
         {"destino", required_argument, NULL, 'd'},
         {"tiempo-limite", required_argument, NULL, 't'},
+        {"tiempo-canal", required_argument, NULL, 'c'},
+        {"reproductor", required_argument, NULL, 'r'},
+        {"sin-reproductor", no_argument, NULL, 'n'},
         {"ayuda", no_argument, NULL, 'h'},
         {"help", no_argument, NULL, 'h'},
         {NULL, 0, NULL, 0}};
@@ -172,6 +188,9 @@ static int leer_config(int argc, char **argv, struct config *cfg)
     cfg->archivo = NULL;
     cfg->destino = NULL;
     cfg->tiempo_limite = 10;
+    cfg->reproductor = NULL;
+    cfg->sin_reproductor = 0;
+    cfg->tiempo_canal = 0;
 
     opterr = 0;
     while ((c = getopt_long(argc, argv, "h", largas, NULL)) != -1)
@@ -198,6 +217,17 @@ static int leer_config(int argc, char **argv, struct config *cfg)
                 ERR_ARG("--tiempo-limite debe ser un numero de segundos entre 1 y 3600 (recibido '%s')", optarg);
             cfg->tiempo_limite = (int)v;
             break;
+        case 'c':
+            if (entero(optarg, 1, 604800, &v) != 0)
+                ERR_ARG("--tiempo-canal debe ser un numero de segundos entre 1 y 604800 (recibido '%s')", optarg);
+            cfg->tiempo_canal = (int)v;
+            break;
+        case 'r':
+            cfg->reproductor = optarg;
+            break;
+        case 'n':
+            cfg->sin_reproductor = 1;
+            break;
         case 'h':
             return 1;
         default:
@@ -218,15 +248,27 @@ static int leer_config(int argc, char **argv, struct config *cfg)
         ERR_ARG("--puerto debe ser un entero entre 1 y 65535 (recibido '%s')", puerto_txt);
     cfg->puerto = (int)v;
 
+    if (cfg->reproductor != NULL && cfg->sin_reproductor)
+        ERR_ARG("--reproductor y --sin-reproductor son contradictorios");
+
+    if (cfg->reproductor != NULL && reproductor_buscar(cfg->reproductor) == NULL)
+        ERR_ARG("--reproductor '%s' no se encontro", cfg->reproductor);
+
     if (strcmp(cfg->accion, "listar") == 0)
     {
         if (cfg->archivo != NULL || cfg->destino != NULL)
             ERR_ARG("--archivo y --destino solo se usan con la accion 'descargar'");
+        if (cfg->tiempo_canal != 0)
+            ERR_ARG("--tiempo-canal solo se usa con la accion 'canal'");
+        if (cfg->reproductor != NULL || cfg->sin_reproductor)
+            ERR_ARG("--reproductor y --sin-reproductor solo se usan con 'canal' o 'descargar'");
         return 0;
     }
 
     if (strcmp(cfg->accion, "descargar") == 0)
     {
+        if (cfg->tiempo_canal != 0)
+            ERR_ARG("--tiempo-canal solo se usa con la accion 'canal'");
         if (cfg->archivo == NULL)
             ERR_ARG("la accion 'descargar' requiere --archivo");
         if (cfg->destino == NULL)
@@ -242,7 +284,11 @@ static int leer_config(int argc, char **argv, struct config *cfg)
     }
 
     if (strcmp(cfg->accion, "canal") == 0)
-        ERR_ARG("la accion 'canal' todavia no esta implementada en esta version");
+    {
+        if (cfg->archivo != NULL || cfg->destino != NULL)
+            ERR_ARG("--archivo y --destino solo se usan con la accion 'descargar'");
+        return 0;
+    }
 
     ERR_ARG("--accion '%s' no es valida; use canal, listar o descargar", cfg->accion);
 }
@@ -450,7 +496,25 @@ static void progreso(uint64_t recibidos, uint64_t total)
     fflush(stdout);
 }
 
-static int accion_descargar(int socket, const struct config *cfg)
+static void iniciar_reproductor(struct reproductor *rep, const struct config *cfg)
+{
+    if (cfg->sin_reproductor)
+        return;
+
+    if (reproductor_iniciar(rep, cfg->reproductor) != 0)
+        log_error("no se encontro un reproductor (mpv, ffplay, vlc, mplayer); se recibira sin reproducir");
+    else
+        log_info("reproductor '%s' iniciado", rep->nombre);
+}
+
+static int64_t ahora_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static int accion_descargar(int socket, const struct config *cfg, struct reproductor *rep)
 {
     struct encabezado enc;
     int rc = SALIDA_INTERNO;
@@ -502,6 +566,8 @@ static int accion_descargar(int socket, const struct config *cfg)
     }
     creado = 1;
 
+    iniciar_reproductor(rep, cfg);
+
     uint64_t recibidos = 0;
     progreso(recibidos, total);
 
@@ -546,6 +612,9 @@ static int accion_descargar(int socket, const struct config *cfg)
             goto fin;
         }
 
+        if (rep->fd >= 0 && reproductor_escribir(rep, bloque, enc.longitud) != 0)
+            log_info("el reproductor se cerro; la descarga continua");
+
         recibidos += enc.longitud;
         progreso(recibidos, total);
     }
@@ -570,7 +639,7 @@ static int accion_descargar(int socket, const struct config *cfg)
         rc = SALIDA_INTERNO;
         goto fin;
     }
-    
+
     fd = -1;
 
     if (rename(cfg->ruta_parcial, cfg->ruta_final) != 0)
@@ -593,6 +662,216 @@ fin:
     return rc;
 }
 
+// Busca "clave = valor" en el string
+static long long meta_valor(const char *txt, const char *clave)
+{
+    size_t kl = strlen(clave);
+    const char *p = txt;
+    while (*p != '\0')
+    {
+        if (strncmp(p, clave, kl) == 0 && p[kl] == '=')
+        {
+            char *fin;
+            errno = 0;
+            long long v = strtoll(p + kl + 1, &fin, 10);
+            return (errno == 0 && fin != p + kl + 1) ? v : -1;
+        }
+        p = strchr(p, '\n');
+        if (p == NULL)
+            break;
+        p++;
+    }
+    return -1;
+}
+
+enum motivo_salida
+{
+    MOTIVO_USUARIO,
+    MOTIVO_TIEMPO,
+    MOTIVO_REPRODUCTOR
+};
+
+static int accion_canal(int socket, const struct config *cfg, struct reproductor *rep)
+{
+    struct encabezado enc;
+    int rc = SALIDA_INTERNO;
+    char meta[512];
+    char *bloque = malloc(TAM_BLOQUE);
+
+    if (bloque == NULL)
+    {
+        log_error("sin memoria");
+        return SALIDA_INTERNO;
+    }
+
+    int uno = 1;
+    setsockopt(socket, SOL_SOCKET, SO_KEEPALIVE, &uno, sizeof uno);
+
+    if (enviar_msg(socket, UNIR, OK, ++g_id, NULL, 0) != PROTOCOL_OK)
+    {
+        log_error("no se pudo enviar la solicitud UNIR");
+        rc = SALIDA_RED;
+        goto fin;
+    }
+    
+    log_info("solicitud UNIR enviada");
+
+    rc = recibir_esperado(socket, EMISION, &enc, meta, sizeof meta - 1);
+    if (rc != 0)
+        goto fin;
+
+    meta[enc.longitud] = '\0';
+
+    long long pos_ms = meta_valor(meta, "posicion_ms");
+    long long ciclo_ms = meta_valor(meta, "ciclo_ms");
+    long long contenido_ms = meta_valor(meta, "contenido_ms");
+    long long sep_ms = meta_valor(meta, "separacion_ms");
+    long long elementos = meta_valor(meta, "elementos");
+    if (pos_ms < 0 || ciclo_ms <= 0 || contenido_ms < 0 || sep_ms < 0)
+    {
+        log_error("el servidor envio metadatos de canal invalidos");
+        rc = SALIDA_INTERNO;
+        goto fin;
+    }
+
+    log_info("incorporado al canal en la posicion %lld.%03lld s (ciclo de %lld.%03lld s, %lld elemento(s), separacion %lld.%03lld s)",
+             pos_ms / 1000, pos_ms % 1000, ciclo_ms / 1000, ciclo_ms % 1000, elementos, sep_ms / 1000, sep_ms % 1000);
+    if (pos_ms >= contenido_ms)
+        log_info("el canal esta en la separacion entre ciclos: la emision empieza en ~%lld s", (ciclo_ms - pos_ms + 999) / 1000);
+
+    iniciar_reproductor(rep, cfg);
+    int usa_rep = rep->pid > 0;
+
+    int64_t limite = cfg->tiempo_canal > 0 ? ahora_ms() + (int64_t)cfg->tiempo_canal * 1000 : 0;
+    int64_t proximo_informe = ahora_ms() + 2000;
+    uint64_t recibidos = 0;
+    enum motivo_salida motivo;
+
+    while (1)
+    {
+        if (g_interrumpido)
+        {
+            motivo = MOTIVO_USUARIO;
+            break;
+        }
+        if (limite != 0 && ahora_ms() >= limite)
+        {
+            motivo = MOTIVO_TIEMPO;
+            break;
+        }
+        if (usa_rep && !reproductor_vivo(rep))
+        {
+            motivo = MOTIVO_REPRODUCTOR;
+            break;
+        }
+
+        if (ahora_ms() >= proximo_informe)
+        {
+            printf("\r  canal: %.2f MB recibidos", (double)recibidos / (1024.0 * 1024.0));
+            fflush(stdout);
+            proximo_informe = ahora_ms() + 2000;
+        }
+
+        struct pollfd p = {.fd = socket, .events = POLLIN, .revents = 0};
+        int pr = poll(&p, 1, 500);
+        if (pr < 0)
+        {
+            if (errno == EINTR)
+                continue;
+
+            printf("\n");
+            log_error("error esperando datos del canal: %s", strerror(errno));
+            rc = SALIDA_RED;
+            goto fin;
+        }
+
+        if (pr == 0)
+            continue;
+
+        int r = recibir_msg(socket, &enc, bloque, TAM_BLOQUE);
+        if (r != PROTOCOL_OK)
+        {
+            printf("\n");
+            rc = fallo_recepcion(r, &enc);
+            goto fin;
+        }
+
+        switch (enc.tipo)
+        {
+        case DATOS:
+            recibidos += enc.longitud;
+            if (usa_rep)
+                reproductor_escribir(rep, bloque, enc.longitud);
+            break;
+
+        case FIN:
+            printf("\n");
+            log_info("el servidor finalizo la transmision del canal");
+            g_flujo_sincronizado = 1;
+            rc = SALIDA_OK;
+            goto fin;
+
+        case DESPEDIDA:
+            printf("\n");
+            log_error("el servidor se esta deteniendo: %.*s", (int)enc.longitud, bloque);
+            rc = SALIDA_RED;
+            goto fin;
+
+        default:
+            printf("\n");
+            rc = mensaje_inesperado(&enc, bloque);
+            goto fin;
+        }
+    }
+
+    printf("\n");
+    switch (motivo)
+    {
+    case MOTIVO_USUARIO:
+        log_info("saliendo del canal por orden del usuario");
+        break;
+    case MOTIVO_TIEMPO:
+        log_info("se cumplio el tiempo de canal solicitado (%d s)", cfg->tiempo_canal);
+        break;
+    case MOTIVO_REPRODUCTOR:
+        log_info("el reproductor se cerro; saliendo del canal");
+        break;
+    }
+
+    if (enviar_msg(socket, SALIR, OK, ++g_id, NULL, 0) != PROTOCOL_OK)
+    {
+        rc = SALIDA_RED;
+        goto fin;
+    }
+
+    // leer los datos que queden
+    int64_t limite_fin = ahora_ms() + 3000;
+    while (ahora_ms() < limite_fin)
+    {
+        struct pollfd p = {.fd = socket, .events = POLLIN, .revents = 0};
+        int pr = poll(&p, 1, 200);
+        if (pr < 0 && errno != EINTR)
+            break;
+        if (pr <= 0)
+            continue;
+        if (recibir_msg(socket, &enc, bloque, TAM_BLOQUE) != PROTOCOL_OK)
+            break;
+        if (enc.tipo == FIN)
+        {
+            g_flujo_sincronizado = 1;
+            break;
+        }
+        if (enc.tipo != DATOS)
+            break;
+    }
+
+    rc = motivo == MOTIVO_USUARIO ? SALIDA_INTERRUMPIDO : SALIDA_OK;
+
+fin:
+    free(bloque);
+    return rc;
+}
+
 // MAIN
 int main(int argc, char **argv)
 {
@@ -606,7 +885,7 @@ int main(int argc, char **argv)
     }
     if (r < 0)
     {
-        fprintf(stderr, "Forma de uso: %s --host DIRECCION --puerto N --accion listar|descargar   (use --ayuda para mas detalles)\n", argv[0]);
+        fprintf(stderr, "Forma de uso: %s --host DIRECCION --puerto N --accion canal|listar|descargar   (use --ayuda para mas detalles)\n", argv[0]);
         return SALIDA_ARGS;
     }
 
@@ -647,13 +926,17 @@ int main(int argc, char **argv)
     saludo[enc.longitud] = '\0'; // arreglar string
     log_info("sesion establecida (servidor: %s)", saludo);
 
-    if (strcmp(cfg.accion, "descargar") == 0)
-        rc = accion_descargar(socket, &cfg);
+    struct reproductor rep = REPRODUCTOR_INICIAL;
+    int es_descarga = strcmp(cfg.accion, "descargar") == 0;
+
+    if (es_descarga)
+        rc = accion_descargar(socket, &cfg, &rep);
+    else if (strcmp(cfg.accion, "canal") == 0)
+        rc = accion_canal(socket, &cfg, &rep);
     else
         rc = accion_listar(socket);
 
-    // Cierre ordenado solo si el flujo sigue sincronizado
-    if (rc != SALIDA_RED && rc != SALIDA_INTERRUMPIDO && rc != SALIDA_INTERNO)
+    if (rc != SALIDA_RED && rc != SALIDA_INTERNO && (rc != SALIDA_INTERRUMPIDO || g_flujo_sincronizado))
     {
         if (enviar_msg(socket, CERRAR, OK, ++g_id, NULL, 0) == PROTOCOL_OK)
         {
@@ -665,6 +948,13 @@ int main(int argc, char **argv)
 
     if (rc == SALIDA_OK)
         log_info("operacion completada");
+
+    // descarga completa, dejar que el reproductor termine de mostrar lo recibido
+    int esperar = es_descarga && rc == SALIDA_OK && rep.fd >= 0;
+    if (esperar)
+        log_info("esperando a que el reproductor termine");
+
+    reproductor_cerrar(&rep, esperar);
 
     return rc;
 }

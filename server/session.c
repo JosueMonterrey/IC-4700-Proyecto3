@@ -15,12 +15,13 @@
 #include <sys/time.h>
 #include <unistd.h>
 
-#include "log.h"
-#include "protocol.h"
+#include "../common/log.h"
+#include "../common/protocol.h"
 
 #define TAM_SOLICITUD 512 // max tam solicitud
 
-#define TXT_SERVICIOS "servicios: listar, descargar"
+#define TXT_SERVICIOS_VOD "servicios: listar, descargar"
+#define TXT_SERVICIOS_CANAL "servicios: listar, descargar, canal"
 #define TXT_DETENCION "el servidor se esta deteniendo"
 
 static volatile sig_atomic_t g_detener = 0;
@@ -137,8 +138,7 @@ static int responder_listar(int socket, const char *origen, const struct catalog
 }
 
 // operacion: ABRIR
-static int responder_abrir(int socket, const char *origen, const struct catalogo *cat,
-                           const struct encabezado *enc, const char *nombre)
+static int responder_abrir(int socket, const char *origen, const struct catalogo *cat, const struct encabezado *enc, const char *nombre)
 {
     size_t len = enc->longitud;
     uint32_t id = enc->id_solicitud;
@@ -258,7 +258,256 @@ fin:
     return resultado;
 }
 
-int atender_sesion(int socket, const struct catalogo *cat, const char *origen, int inactividad)
+// CANAL EN VIVO
+#define ADELANTO_NS 1000000000LL // cuanto se puede enviar por delante de la linea de tiempo
+#define PASO_ESPERA_MS 200       // cada cuanto se revisa detencion / mensajes del cliente
+
+enum fin_canal
+{
+    CANAL_SIGUE,
+    CANAL_SALIO,     // el cliente envio SALIR
+    CANAL_PERDIDO,   // el cliente desaparecio o envio basura
+    CANAL_DETENCION, // el servidor se esta deteniendo
+    CANAL_ERROR      // fallo al leer el contenido
+};
+
+// Durante una transferencia solo se admite SALIR. Cualquier otra cosa se rechaza.
+static enum fin_canal revisar_cliente(int socket, const char *origen)
+{
+    struct pollfd p = {.fd = socket, .events = POLLIN, .revents = 0};
+    int r = poll(&p, 1, 0);
+    if (r < 0)
+        return errno == EINTR ? CANAL_SIGUE : CANAL_PERDIDO;
+    if (r == 0)
+        return CANAL_SIGUE;
+
+    struct encabezado enc;
+    char buff[TAM_SOLICITUD];
+    int rr = recibir_msg(socket, &enc, buff, sizeof buff);
+    if (rr != PROTOCOL_OK)
+    {
+        if (rr == PROTOCOL_ERR_LONGITUD || rr == PROTOCOL_ERR_VERSION)
+        {
+            enviar_texto(socket, ERROR, rr == PROTOCOL_ERR_VERSION ? VERSION : SOLICITUD,
+                         enc.id_solicitud, "mensaje invalido durante la transmision");
+            log_error("[%s] canal: mensaje invalido del cliente", origen);
+        }
+        else
+            log_info("[%s] canal: el cliente se desconecto", origen);
+        return CANAL_PERDIDO;
+    }
+
+    if (enc.tipo == SALIR)
+        return CANAL_SALIO;
+
+    enviar_texto(socket, ERROR, NO_PERMITIDO, enc.id_solicitud,
+                 "hay una transmision en curso: envie SALIR antes de otra solicitud");
+    log_error("[%s] canal: solicitud tipo %u rechazada (transmision en curso)", origen, (unsigned)enc.tipo);
+    return CANAL_SIGUE;
+}
+
+// Espera sin enviar nada hasta limite_ns
+static enum fin_canal esperar_hasta(int socket, const char *origen, int64_t limite_ns)
+{
+    while (1)
+    {
+        if (g_detener)
+            return CANAL_DETENCION;
+
+        int64_t resto = limite_ns - canal_ahora_ns();
+        if (resto <= 0)
+            return CANAL_SIGUE;
+
+        int ms = resto > (int64_t)PASO_ESPERA_MS * 1000000LL ? PASO_ESPERA_MS : (int)((resto + 999999) / 1000000);
+        struct pollfd p = {.fd = socket, .events = POLLIN, .revents = 0};
+        int r = poll(&p, 1, ms);
+        if (r < 0)
+        {
+            if (errno == EINTR)
+                continue;
+            return CANAL_PERDIDO;
+        }
+        if (r > 0)
+        {
+            enum fin_canal f = revisar_cliente(socket, origen);
+            if (f != CANAL_SIGUE)
+                return f;
+        }
+    }
+}
+
+// operacion: UNIR
+static int responder_unir(int socket, const char *origen, const struct canal *canal, const struct encabezado *enc)
+{
+    uint32_t id = enc->id_solicitud;
+
+    if (canal == NULL)
+    {
+        enviar_texto(socket, ERROR, NO_SERVIBLE, id, "el canal en vivo no esta disponible en este momento");
+        log_error("[%s] UNIR: el canal no esta disponible", origen);
+        return 0;
+    }
+
+    if (enc->longitud != 0)
+    {
+        enviar_texto(socket, ERROR, NO_PERMITIDO, id, "el canal no permite elegir una posicion de reproduccion");
+        log_error("[%s] UNIR: se intento indicar una posicion (rechazado)", origen);
+        return 0;
+    }
+
+    struct posicion_canal pos;
+    canal_posicion(canal, canal_ahora_ns(), &pos);
+
+    char meta[320];
+    int mlen = snprintf(meta, sizeof meta,
+                        "posicion_ms=%lld\n"
+                        "ciclo_ms=%lld\n"
+                        "contenido_ms=%lld\n"
+                        "separacion_ms=%lld\n"
+                        "elementos=%zu\n"
+                        "elemento_actual=%zu\n"
+                        "numero_ciclo=%llu\n"
+                        "en_separacion=%d\n",
+                        (long long)(pos.pos_ns / 1000000),
+                        (long long)(canal->ciclo_ns / 1000000),
+                        (long long)(canal->contenido_ns / 1000000),
+                        (long long)(canal->separacion_ns / 1000000),
+                        canal->cantidad,
+                        pos.indice + 1,
+                        (unsigned long long)pos.ciclo, pos.en_separacion);
+
+    char *bloque = malloc(TAM_BLOQUE);
+    if (bloque == NULL)
+    {
+        enviar_texto(socket, ERROR, INTERNO, id, "error interno del servidor");
+        log_error("[%s] UNIR: sin memoria", origen);
+        return 0;
+    }
+
+    if (enviar_msg(socket, EMISION, OK, id, meta, (uint32_t)mlen) != PROTOCOL_OK)
+    {
+        free(bloque);
+        log_error("[%s] UNIR: fallo al enviar EMISION", origen);
+        return -1;
+    }
+
+    log_info("[%s] UNIR: incorporado en %lld.%03lld s (ciclo %llu, elemento %zu/%zu%s)", origen,
+             (long long)(pos.pos_ns / 1000000000LL), (long long)((pos.pos_ns / 1000000) % 1000),
+             (unsigned long long)pos.ciclo, pos.indice + 1, canal->cantidad,
+             pos.en_separacion ? ", en separacion entre ciclos" : "");
+
+    uint64_t ciclo = pos.ciclo;
+    size_t i = pos.indice;
+    uint64_t byte = pos.byte;
+    int en_separacion = pos.en_separacion;
+    uint64_t enviados = 0;
+    int fd = -1;
+    enum fin_canal fin = CANAL_SIGUE;
+
+    while (fin == CANAL_SIGUE)
+    {
+        int64_t base = canal->t0_ns + (int64_t)ciclo * canal->ciclo_ns; // inicio del ciclo actual
+
+        if (en_separacion)
+        {
+            fin = esperar_hasta(socket, origen, base + canal->ciclo_ns);
+            ciclo++;
+            i = 0;
+            byte = 0;
+            en_separacion = 0;
+            continue;
+        }
+
+        const struct elemento_canal *el = &canal->elementos[i];
+        fd = open(el->ruta, O_RDONLY);
+        if (fd < 0 || lseek(fd, (off_t)byte, SEEK_SET) < 0)
+        {
+            log_error("[%s] canal: no se pudo abrir '%s': %s", origen, el->ruta, strerror(errno));
+            fin = CANAL_ERROR;
+            break;
+        }
+
+        while (byte < el->tamano && fin == CANAL_SIGUE)
+        {
+            // el bloque se emite cuando su instante en la linea de tiempo esta a menos de ADELANTO_NS
+            int64_t objetivo = base + canal_instante_byte(el, byte);
+            fin = esperar_hasta(socket, origen, objetivo - ADELANTO_NS);
+            if (fin != CANAL_SIGUE)
+                break;
+
+            fin = revisar_cliente(socket, origen);
+            if (fin != CANAL_SIGUE)
+                break;
+
+            uint64_t restante = el->tamano - byte;
+            size_t solicitar = restante < TAM_BLOQUE ? (size_t)restante : (size_t)TAM_BLOQUE;
+            ssize_t n = read(fd, bloque, solicitar);
+            if (n < 0 && errno == EINTR)
+                continue;
+            if (n <= 0)
+            {
+                log_error("[%s] canal: lectura fallida de '%s' (%s)", origen, el->ruta,
+                          n < 0 ? strerror(errno) : "fin de archivo prematuro");
+                fin = CANAL_ERROR;
+                break;
+            }
+
+            if (enviar_msg(socket, DATOS, OK, id, bloque, (uint32_t)n) != PROTOCOL_OK)
+            {
+                log_info("[%s] canal: cliente perdido tras %llu bytes", origen, (unsigned long long)enviados);
+                fin = CANAL_PERDIDO;
+                break;
+            }
+
+            byte += (uint64_t)n;
+            enviados += (uint64_t)n;
+        }
+
+        close(fd);
+        fd = -1;
+        if (fin != CANAL_SIGUE)
+            break;
+
+        // siguiente elemento, empieza otro ciclo
+        byte = 0;
+        if (++i == canal->cantidad)
+        {
+            i = 0;
+            if (canal->separacion_ns > 0)
+                en_separacion = 1;
+            else
+                ciclo++;
+        }
+    }
+
+    free(bloque);
+    if (fd >= 0)
+        close(fd);
+
+    switch (fin)
+    {
+    case CANAL_SALIO:
+        log_info("[%s] canal: el cliente abandono la transmision (%llu bytes enviados)", origen, (unsigned long long)enviados);
+        if (enviar_msg(socket, FIN, OK, id, NULL, 0) != PROTOCOL_OK)
+            return -1;
+        return 0;
+
+    case CANAL_ERROR:
+        enviar_texto(socket, ERROR, INTERNO, id, "error al leer el contenido del canal");
+        return 0;
+
+    case CANAL_DETENCION:
+        enviar_texto(socket, DESPEDIDA, OK, id, TXT_DETENCION);
+        log_info("[%s] servidor deteniendose: canal cerrado", origen);
+        return -1;
+
+    case CANAL_PERDIDO:
+    default:
+        return -1;
+    }
+}
+
+int atender_sesion(int socket, const struct catalogo *cat, const struct canal *canal, const char *origen, int inactividad)
 {
     struct encabezado enc;
     char buff[TAM_SOLICITUD];
@@ -277,7 +526,7 @@ int atender_sesion(int socket, const struct catalogo *cat, const char *origen, i
         return -1;
     }
 
-    if (enviar_texto(socket, BIENVENIDA, OK, enc.id_solicitud, TXT_SERVICIOS) != PROTOCOL_OK)
+    if (enviar_texto(socket, BIENVENIDA, OK, enc.id_solicitud, canal ? TXT_SERVICIOS_CANAL : TXT_SERVICIOS_VOD) != PROTOCOL_OK)
     {
         log_error("[%s] no se pudo enviar BIENVENIDA", origen);
         return -1;
@@ -300,6 +549,11 @@ int atender_sesion(int socket, const struct catalogo *cat, const char *origen, i
 
         case ABRIR:
             if (responder_abrir(socket, origen, cat, &enc, buff) != 0)
+                return -1;
+            break;
+
+        case UNIR:
+            if (responder_unir(socket, origen, canal, &enc) != 0)
                 return -1;
             break;
 
