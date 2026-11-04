@@ -5,6 +5,7 @@
 #include <getopt.h>
 #include <netinet/in.h>
 #include <poll.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -69,7 +70,6 @@ static void ayuda(FILE *out, const char *prog)
             "\n"
             "Obligatorios:\n"
             "  --modo MODO          Modo de concurrencia: FIFO | FORKED | THREADED\n"
-            "                       (por ahora estan implementados FIFO y FORKED)\n"
             "  --puerto N           Puerto de escucha (1-65535)\n"
             "  --dir RUTA           Directorio con los videos del catalogo\n"
             "  --canal ARCHIVO      Contenido del canal en vivo. Se puede repetir para formar una\n"
@@ -82,8 +82,9 @@ static void ayuda(FILE *out, const char *prog)
             "                       (por omision: 60)\n"
             "  --profundidad N      Conexiones pendientes admitidas en la cola\n"
             "                       (por omision: 16)\n"
-            "  --max-clientes N     Maximo de clientes activos simultaneos en modo FORKED\n"
-            "                       (por omision: 64). Los excedentes reciben error de capacidad\n"
+            "  --max-clientes N     Maximo de clientes activos simultaneos en modo FORKED y\n"
+            "                       THREADED (por omision: 64). Los excedentes reciben error\n"
+            "                       de capacidad\n"
             "  --duracion-canal S   Duracion total declarada del contenido del canal, en segundos.\n"
             "                       Si se omite, se consulta a ffprobe archivo por archivo\n"
             "  --separacion S       Segundos sin contenido entre el final de un ciclo y el inicio\n"
@@ -92,7 +93,7 @@ static void ayuda(FILE *out, const char *prog)
             "\n"
             "Ejemplos:\n"
             "  %s --modo FIFO --puerto 8080 --dir videos/ --canal canal.ts\n"
-            "  %s --modo FORKED --puerto 9000 --dir /srv/videos --canal a.ts --canal b.ts \\\n"
+            "  %s --modo THREADED --puerto 9000 --dir /srv/videos --canal a.ts --canal b.ts \\\n"
             "       --duracion-canal 600 --separacion 5 --direccion 127.0.0.1 --max-clientes 20\n"
             "\n"
             "Codigos de salida: 0 exito, 2 argumentos, 3 red, 5 capacidad, 6 interno.\n",
@@ -244,9 +245,6 @@ static int leer_config(int argc, char **argv, struct config *cfg)
     else
         return error_arg("--modo '%s' no es valido. Permitido: FIFO, FORKED o THREADED", modo_txt);
 
-    if (cfg->modo == THREADED)
-        return error_arg("el modo THREADED todavia no esta implementado en esta version");
-
     if (entero(puerto_txt, 1, 65535, &v) != 0)
         return error_arg("--puerto debe ser un entero entre 1 y 65535 (recibido '%s')", puerto_txt);
     cfg->puerto = (int)v;
@@ -308,6 +306,23 @@ static void instalar_senales(void)
     sigaction(SIGINT, &saddr, NULL);
     sigaction(SIGTERM, &saddr, NULL);
     signal(SIGPIPE, SIG_IGN);
+}
+
+static void rechazar_capacidad(int cs, const char *origen, int max)
+{
+    struct timeval tv = {.tv_sec = 0, .tv_usec = 300000};
+    setsockopt(cs, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    setsockopt(cs, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+
+    struct encabezado enc;
+    char buff[512];
+    uint32_t id = 0;
+    if (recibir_msg(cs, &enc, buff, sizeof buff) == PROTOCOL_OK)
+        id = enc.id_solicitud;
+
+    const char *txt = "el servidor alcanzo su limite de clientes; intente mas tarde";
+    enviar_msg(cs, ERROR, CAPACIDAD, id, txt, (uint32_t)strlen(txt));
+    log_error("[%s] rechazado: limite de %d clientes activos alcanzado", origen, max);
 }
 
 // MODO FORKED
@@ -405,21 +420,79 @@ static void hijos_terminar(struct hijos *h)
     }
 }
 
-static void rechazar_capacidad(int cs, const char *origen, int max)
+// MODO THREADED
+static pthread_mutex_t g_mtx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_cond = PTHREAD_COND_INITIALIZER;
+static size_t g_hilos_activos = 0;
+
+// Datos que el hilo principal le entrega a cada hilo de sesion
+struct tarea
 {
-    struct timeval tv = {.tv_sec = 0, .tv_usec = 300000};
-    setsockopt(cs, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
-    setsockopt(cs, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+    int socket;
+    char origen[64];
+    const struct catalogo *cat;
+    const struct canal *canal;
+    int inactividad;
+};
 
-    struct encabezado enc;
-    char buff[512];
-    uint32_t id = 0;
-    if (recibir_msg(cs, &enc, buff, sizeof buff) == PROTOCOL_OK)
-        id = enc.id_solicitud;
+static size_t hilos_activos(void)
+{
+    pthread_mutex_lock(&g_mtx);
+    size_t n = g_hilos_activos;
+    pthread_mutex_unlock(&g_mtx);
+    return n;
+}
 
-    const char *txt = "el servidor alcanzo su limite de clientes; intente mas tarde";
-    enviar_msg(cs, ERROR, CAPACIDAD, id, txt, (uint32_t)strlen(txt));
-    log_error("[%s] rechazado: limite de %d clientes activos alcanzado", origen, max);
+static void hilos_sumar(void)
+{
+    pthread_mutex_lock(&g_mtx);
+    g_hilos_activos++;
+    pthread_mutex_unlock(&g_mtx);
+}
+
+static void hilos_restar(void)
+{
+    pthread_mutex_lock(&g_mtx);
+    g_hilos_activos--;
+    pthread_cond_broadcast(&g_cond);
+    pthread_mutex_unlock(&g_mtx);
+}
+
+static void *hilo_sesion(void *arg)
+{
+    struct tarea *t = arg;
+
+    // Las senales de terminacion las atiende solo el hilo principal
+    sigset_t bloqueadas;
+    sigemptyset(&bloqueadas);
+    sigaddset(&bloqueadas, SIGINT);
+    sigaddset(&bloqueadas, SIGTERM);
+    pthread_sigmask(SIG_BLOCK, &bloqueadas, NULL);
+
+    atender_sesion(t->socket, t->cat, t->canal, t->origen, t->inactividad);
+    close(t->socket);
+    log_info("[%s] conexion cerrada (el hilo termina)", t->origen);
+
+    free(t);
+    hilos_restar();
+    return NULL;
+}
+
+static size_t hilos_esperar(int segundos)
+{
+    struct timespec limite;
+    clock_gettime(CLOCK_REALTIME, &limite);
+    limite.tv_sec += segundos;
+
+    pthread_mutex_lock(&g_mtx);
+    while (g_hilos_activos > 0)
+    {
+        if (pthread_cond_timedwait(&g_cond, &g_mtx, &limite) == ETIMEDOUT)
+            break;
+    }
+    size_t quedan = g_hilos_activos;
+    pthread_mutex_unlock(&g_mtx);
+    return quedan;
 }
 
 // MAIN
@@ -436,7 +509,7 @@ int main(int argc, char **argv)
     }
     if (r < 0)
     {
-        fprintf(stderr, "Forma de uso: %s --modo FIFO|FORKED --puerto N --dir RUTA --canal ARCHIVO   (use --ayuda para mas detalles)\n", argv[0]);
+        fprintf(stderr, "Forma de uso: %s --modo FIFO|FORKED|THREADED --puerto N --dir RUTA --canal ARCHIVO   (use --ayuda para mas detalles)\n", argv[0]);
         return SALIDA_ARGS;
     }
 
@@ -484,13 +557,19 @@ int main(int argc, char **argv)
         return SALIDA_INTERNO;
     }
 
+    // hilos
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    pthread_attr_setstacksize(&attr, 512 * 1024);
+
     if (hay_canal)
         canal_iniciar(&canal); // t0
 
     log_info("Servidor iniciado. Modo=%s, escuchando en %s:%d", nombre_modo(cfg.modo), cfg.direccion, cfg.puerto);
     log_info("Catalogo: %zu entradas (%zu disponibles). Inactividad=%d s, cola=%d", cat.cantidad, disponibles, cfg.inactividad, cfg.profundidad);
     
-    if (cfg.modo == FORKED)
+    if (cfg.modo != FIFO)
         log_info("Maximo de clientes activos: %d", cfg.max_clientes);
 
     if (hay_canal)
@@ -504,7 +583,6 @@ int main(int argc, char **argv)
         if (cfg.modo == FORKED)
             hijos_recolectar(&hijos);
 
-        /* Se espera con poll() para poder revisar la bandera de detención. */
         struct pollfd p = {.fd = socket, .events = POLLIN, .revents = 0};
         int n = poll(&p, 1, 500);
         if (n < 0)
@@ -526,7 +604,7 @@ int main(int argc, char **argv)
                 continue;
 
             log_error("accept() fallo: %s", strerror(errno));
-            sleep(1); // Delay
+            sleep(1);
             continue;
         }
 
@@ -547,10 +625,54 @@ int main(int argc, char **argv)
             continue;
         }
 
-        // ---- FORKED ----
-        hijos_recolectar(&hijos);
+        // FORKED
+        if (cfg.modo == FORKED)
+        {
+            hijos_recolectar(&hijos);
 
-        if (hijos.activos >= (size_t)cfg.max_clientes)
+            if (hijos.activos >= (size_t)cfg.max_clientes)
+            {
+                rechazar_capacidad(client_socket, origen, cfg.max_clientes);
+                close(client_socket);
+                rechazadas++;
+                continue;
+            }
+
+            pid_t pid = fork();
+            if (pid < 0)
+            {
+                log_error("[%s] fork() fallo: %s", origen, strerror(errno));
+                const char *txt = "error interno del servidor";
+                enviar_msg(client_socket, ERROR, INTERNO, 0, txt, (uint32_t)strlen(txt));
+                close(client_socket);
+                rechazadas++;
+                continue;
+            }
+
+            if (pid == 0)
+            {
+                // hijo solo conserva el socket de su cliente
+                close(socket);
+                free(hijos.pids);
+
+                atender_sesion(client_socket, &cat, hay_canal ? &canal : NULL, origen, cfg.inactividad);
+                close(client_socket);
+                log_info("[%s] conexion cerrada (proceso hijo %ld termina)", origen, (long)getpid());
+                _exit(0);
+            }
+
+            // proceso padre
+            close(client_socket);
+            if (hijos_agregar(&hijos, pid) != 0)
+                log_error("tabla de hijos inconsistente (pid %ld)", (long)pid);
+            atendidas++;
+            log_info("[%s] conexion admitida (FORKED: hijo %ld, %zu/%d activos)", origen, (long)pid, hijos.activos, cfg.max_clientes);
+            continue;
+        }
+
+        // THREADED
+        size_t activos = hilos_activos();
+        if (activos >= (size_t)cfg.max_clientes)
         {
             rechazar_capacidad(client_socket, origen, cfg.max_clientes);
             close(client_socket);
@@ -558,10 +680,10 @@ int main(int argc, char **argv)
             continue;
         }
 
-        pid_t pid = fork();
-        if (pid < 0)
+        struct tarea *t = malloc(sizeof *t);
+        if (t == NULL)
         {
-            log_error("[%s] fork() fallo: %s", origen, strerror(errno));
+            log_error("[%s] sin memoria para crear el hilo", origen);
             const char *txt = "error interno del servidor";
             enviar_msg(client_socket, ERROR, INTERNO, 0, txt, (uint32_t)strlen(txt));
             close(client_socket);
@@ -569,39 +691,64 @@ int main(int argc, char **argv)
             continue;
         }
 
-        if (pid == 0)
-        {
-            // hijo solo conserva el socket de su cliente
-            close(socket);
-            free(hijos.pids);
+        t->socket = client_socket;
+        snprintf(t->origen, sizeof t->origen, "%s", origen);
+        t->cat = &cat;
+        t->canal = hay_canal ? &canal : NULL;
+        t->inactividad = cfg.inactividad;
 
-            atender_sesion(client_socket, &cat, hay_canal ? &canal : NULL, origen, cfg.inactividad);
+        hilos_sumar(); // se cuenta ANTES de crear el hilo para evitar una carrera con su salida
+
+        pthread_t th;
+        int rc = pthread_create(&th, &attr, hilo_sesion, t);
+        if (rc != 0)
+        {
+            hilos_restar();
+            log_error("[%s] pthread_create() fallo: %s", origen, strerror(rc));
+            const char *txt = "error interno del servidor";
+            enviar_msg(client_socket, ERROR, INTERNO, 0, txt, (uint32_t)strlen(txt));
             close(client_socket);
-            log_info("[%s] conexion cerrada (proceso hijo %ld termina)", origen, (long)getpid());
-            _exit(0);
+            free(t);
+            rechazadas++;
+            continue;
         }
 
-        // proceso padre
-        close(client_socket);
-        if (hijos_agregar(&hijos, pid) != 0)
-            log_error("tabla de hijos inconsistente (pid %ld)", (long)pid);
-
         atendidas++;
-        log_info("[%s] conexion admitida (FORKED: hijo %ld, %zu/%d activos)", origen, (long)pid, hijos.activos, cfg.max_clientes);
+        log_info("[%s] conexion admitida (THREADED: %zu/%d activos)", origen, activos + 1, cfg.max_clientes);
     }
 
     // 6. Cerrar servidor
     close(socket);
-    
+    pthread_attr_destroy(&attr);
+
     if (cfg.modo == FORKED)
     {
         hijos_terminar(&hijos);
         free(hijos.pids);
     }
 
-    catalogo_liberar(&cat);
-    if (hay_canal)
-        canal_liberar(&canal);
+    int liberar = 1;
+    if (cfg.modo == THREADED)
+    {
+        size_t activos = hilos_activos();
+        if (activos > 0)
+            log_info("esperando a que concluyan %zu sesion(es)...", activos);
+
+        size_t quedan = hilos_esperar(5);
+        if (quedan > 0)
+        {
+            log_error("%zu sesion(es) no concluyeron a tiempo; el proceso termina de todos modos", quedan);
+            liberar = 0;
+        }
+    }
+
+    if (liberar)
+    {
+        catalogo_liberar(&cat);
+        if (hay_canal)
+            canal_liberar(&canal);
+    }
+
     log_info("Servidor detenido de forma ordenada. Sesiones atendidas: %lu, rechazadas: %lu", atendidas, rechazadas);
 
     return SALIDA_OK;
